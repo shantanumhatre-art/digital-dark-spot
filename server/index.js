@@ -1,4 +1,3 @@
-
 import express from 'express'
 import cors from 'cors'
 import dotenv from 'dotenv'
@@ -12,16 +11,13 @@ const PORT = process.env.PORT || 5000
 
 app.use(cors({
   origin(origin, callback) {
-    // Allow the local Vite development ports used by this project.
-    if (!origin) return callback(null, true)
-    try {
-      const parsed = new URL(origin)
-      const isLocalHost = ['localhost', '127.0.0.1'].includes(parsed.hostname)
-      const isVitePort = Number(parsed.port) >= 5173 && Number(parsed.port) <= 5180
-      return callback(null, isLocalHost && isVitePort)
-    } catch {
-      return callback(new Error('Origin not allowed by CORS'))
+    if (
+      !origin ||
+      /^https?:\/\/(localhost|127\.0\.0\.1):(517[3-9]|5180)$/.test(origin)
+    ) {
+      return callback(null, true)
     }
+    return callback(new Error('CORS origin not allowed.'))
   }
 }))
 
@@ -61,51 +57,63 @@ function validPublicUrl(value) {
   }
 }
 
+// Fetch up to 8 sources concurrently to reduce waiting time.
 async function collectSources(input) {
-  const collected = []
+  const results = await Promise.all(
+    input.slice(0, 8).map(async source => {
+      let text = String(source.text || '').trim()
+      const title = String(source.title || 'Untitled source').slice(0, 160)
+      const url = String(source.url || '').trim()
 
-  for (const source of input.slice(0, 8)) {
-    let text = String(source.text || '').trim()
-    const title = String(source.title || 'Untitled source').slice(0, 160)
-    const url = String(source.url || '').trim()
-
-    if (!text && url) {
-      if (!validPublicUrl(url)) {
-        throw new Error(`The URL for "${title}" is not a valid public HTTP/HTTPS address.`)
-      }
-
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), 9000)
-
-      try {
-        const response = await fetch(url, {
-          signal: controller.signal,
-          headers: { 'User-Agent': 'DigitalDarkSpotResearchPrototype/1.0' }
-        })
-
-        if (!response.ok) {
-          throw new Error(`Could not retrieve ${url} (HTTP ${response.status}).`)
+      if (!text && url) {
+        if (!validPublicUrl(url)) {
+          throw new Error(
+            `The URL for "${title}" is not a valid public HTTP/HTTPS address.`
+          )
         }
 
-        const type = response.headers.get('content-type') || ''
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), 9000)
 
-        if (!type.includes('text/html') && !type.includes('text/plain')) {
-          throw new Error(`"${title}" is not an HTML or plain-text page. Paste its relevant text instead.`)
+        try {
+          const response = await fetch(url, {
+            signal: controller.signal,
+            headers: {
+              'User-Agent': 'DigitalDarkSpotResearchPrototype/1.0'
+            }
+          })
+
+          if (!response.ok) {
+            throw new Error(
+              `Could not retrieve ${url} (HTTP ${response.status}).`
+            )
+          }
+
+          const type = response.headers.get('content-type') || ''
+
+          if (!type.includes('text/html') && !type.includes('text/plain')) {
+            throw new Error(
+              `"${title}" is not an HTML or plain-text page. Paste its relevant text instead.`
+            )
+          }
+
+          const body = await response.text()
+
+          text = type.includes('text/html')
+            ? cleanText(body)
+            : body.replace(/\s+/g, ' ').trim()
+        } finally {
+          clearTimeout(timeout)
         }
-
-        const body = await response.text()
-        text = type.includes('text/html')
-          ? cleanText(body)
-          : body.replace(/\s+/g, ' ').trim()
-      } finally {
-        clearTimeout(timeout)
       }
-    }
 
-    if (text) collected.push({ title, url, text: text.slice(0, 18000) })
-  }
+      return text
+        ? { title, url, text: text.slice(0, 18000) }
+        : null
+    })
+  )
 
-  return collected
+  return results.filter(Boolean)
 }
 
 const stopWords = new Set([
@@ -128,8 +136,6 @@ function words(text) {
   ]
 }
 
-// Initial relevance estimate based on shared topic terms.
-// Gemini can refine this classification.
 function estimateRelevance(question, source) {
   const questionWords = words(question)
   const sourceWords = new Set(words(source.text))
@@ -175,9 +181,11 @@ function validateFindings(items, sources, fallbackItems) {
 
       if (!source || excerpt.length < 20 || excerpt.length > 500) return []
 
-      if (!normalizeEvidenceText(source.text).includes(
-        normalizeEvidenceText(excerpt)
-      )) return []
+      if (
+        !normalizeEvidenceText(source.text).includes(
+          normalizeEvidenceText(excerpt)
+        )
+      ) return []
 
       return [{ sourceTitle: source.title, excerpt }]
     })
@@ -185,14 +193,7 @@ function validateFindings(items, sources, fallbackItems) {
     return {
       title: String(item.title || 'Untitled finding'),
       detail: String(item.detail || ''),
-      sourceTitles: [...new Set([
-        ...(Array.isArray(item.sourceTitles)
-          ? item.sourceTitles.filter(title =>
-              typeof title === 'string' && sources.some(source => source.title === title)
-            )
-          : []),
-        ...evidence.map(entry => entry.sourceTitle)
-      ])],
+      sourceTitles: [...new Set(evidence.map(entry => entry.sourceTitle))],
       evidence,
       severity: String(item.severity || 'review')
     }
@@ -210,7 +211,6 @@ function ruleAnalysis(question, allSources) {
     source => source.relevance.status === 'irrelevant'
   )
 
-  // If every source is irrelevant, do not analyse them as useful evidence.
   if (!relevantSources.length) {
     return {
       mode: 'rules',
@@ -219,7 +219,8 @@ function ruleAnalysis(question, allSources) {
       sources: sources.map(source => ({
         title: source.title,
         url: source.url,
-        excerpt: source.text.slice(0, 260) + (source.text.length > 260 ? '…' : ''),
+        excerpt: source.text.slice(0, 260) +
+          (source.text.length > 260 ? '…' : ''),
         words: source.text.split(/\s+/).filter(Boolean).length,
         relevance: source.relevance
       })),
@@ -296,7 +297,10 @@ function ruleAnalysis(question, allSources) {
   ]
 
   for (const check of checks) {
-    if (check.questionPattern.test(question) && !check.sourcePattern.test(allText)) {
+    if (
+      check.questionPattern.test(question) &&
+      !check.sourcePattern.test(allText)
+    ) {
       gaps.push({
         title: `Potential gap: ${check.name}`,
         detail: check.message,
@@ -325,33 +329,29 @@ function ruleAnalysis(question, allSources) {
   }
 
   const conflicts = []
-  const datePattern = /(deadline|closes on|close on|last date|apply by)\D{0,35}(\d{1,2}\s+[A-Za-z]+\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})/i
 
-  const dateMatches = relevantSources.map(source => {
-    const found = datePattern.exec(source.text)
-    if (!found) return null
-    const start = Math.max(0, found.index - 100)
-    const end = Math.min(source.text.length, found.index + found[0].length + 100)
-    return {
-      title: source.title,
-      match: found[0],
-      evidence: source.text.slice(start, end).slice(0, 500)
-    }
-  }).filter(Boolean)
+  const datePattern =
+    /(deadline|closes on|close on|last date|apply by)\D{0,35}(\d{1,2}\s+[A-Za-z]+\s+20\d{2}|\d{1,2}[/-]\d{1,2}[/-]20\d{2})/i
+
+  const dateMatches = relevantSources.map(source => ({
+    title: source.title,
+    match: source.text.match(datePattern)?.[0]
+  })).filter(item => item.match)
 
   const distinctDates = new Set(
-    dateMatches.map(item => item.match.toLowerCase().replace(/\s+/g, ' ').trim())
+    dateMatches.map(item =>
+      item.match.toLowerCase().replace(/\s+/g, ' ').trim()
+    )
   )
 
   if (dateMatches.length > 1 && distinctDates.size > 1) {
     conflicts.push({
       title: 'Different dates or deadlines',
-      detail: dateMatches.map(item => `${item.title}: "${item.match}"`).join(' | ') + '. Verify the full context.',
+      detail: dateMatches.map(item =>
+        `${item.title}: "${item.match}"`
+      ).join(' | ') + '. Verify the full context.',
       sourceTitles: dateMatches.map(item => item.title),
-      evidence: dateMatches.map(item => ({
-        sourceTitle: item.title,
-        excerpt: item.evidence
-      })),
+      evidence: [],
       severity: 'review'
     })
   }
@@ -360,27 +360,17 @@ function ruleAnalysis(question, allSources) {
   const outdated = []
 
   for (const source of relevantSources) {
-    const yearMatches = [...source.text.matchAll(/\b20\d{2}\b/g)]
-    const years = yearMatches.map(match => Number(match[0]))
+    const years = [...source.text.matchAll(/\b20\d{2}\b/g)]
+      .map(match => Number(match[0]))
 
-    const oldYearMatches = yearMatches.filter(match =>
-      Number(match[0]) < currentYear - 1
-    )
-    const oldYears = oldYearMatches.map(match => Number(match[0]))
+    const oldYears = years.filter(year => year < currentYear - 1)
 
     if (oldYears.length) {
       outdated.push({
         title: `Older year reference in ${source.title}`,
         detail: `This source includes year reference(s): ${[...new Set(oldYears)].join(', ')}. Check whether the information is still current.`,
         sourceTitles: [source.title],
-        evidence: oldYearMatches.slice(0, 3).map(match => {
-          const start = Math.max(0, match.index - 90)
-          const end = Math.min(source.text.length, match.index + match[0].length + 90)
-          return {
-            sourceTitle: source.title,
-            excerpt: source.text.slice(start, end).slice(0, 500)
-          }
-        })
+        evidence: []
       })
     }
 
@@ -405,7 +395,8 @@ function ruleAnalysis(question, allSources) {
     sources: sources.map(source => ({
       title: source.title,
       url: source.url,
-      excerpt: source.text.slice(0, 260) + (source.text.length > 260 ? '…' : ''),
+      excerpt: source.text.slice(0, 260) +
+        (source.text.length > 260 ? '…' : ''),
       words: source.text.split(/\s+/).filter(Boolean).length,
       relevance: source.relevance
     })),
@@ -416,7 +407,9 @@ function ruleAnalysis(question, allSources) {
       'Open each original source and confirm it is relevant and authoritative.',
       'Check publication dates and whether the information is current.',
       ...gaps.slice(0, 3).map(gap => gap.detail),
-      ...conflicts.map(item => `Resolve this possible conflict: ${item.title}.`),
+      ...conflicts.map(item =>
+        `Resolve this possible conflict: ${item.title}.`
+      ),
       'Record the exact source and evidence for important decisions.'
     ],
     topics: questionWords.slice(0, 8)
@@ -430,7 +423,9 @@ async function geminiAnalysis(question, allSources, fallback) {
   }
 
   try {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+    const ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY
+    })
 
     const prompt = `
 You are an evidence-first research assistant for Digital Dark Spot.
@@ -513,44 +508,57 @@ ${source.text.slice(0, 9000)}
 `).join('\n')}
 `
 
-    const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash'
+    // Retry temporary Gemini overload and server errors.
     let response
     let lastError
 
-    for (let attempt = 0; attempt < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         response = await ai.models.generateContent({
-          model,
+          model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
           contents: prompt,
-          config: { responseMimeType: 'application/json' }
+          config: {
+            responseMimeType: 'application/json'
+          }
         })
-        lastError = null
         break
       } catch (error) {
         lastError = error
-        const message = String(error?.message || '')
-        const retryable = /\b(429|500|502|503|504)\b|UNAVAILABLE|high demand|temporarily unavailable/i.test(message)
-        if (!retryable || attempt === 2) break
+        const message = String(error?.message || error)
+        const retryable =
+          /429|500|502|503|504|UNAVAILABLE|high demand|overloaded/i.test(message)
+
+        if (!retryable || attempt === 2) throw error
+
         const delay = 1000 * (attempt + 1)
-        console.warn(`Gemini temporary error; retrying in ${delay}ms (attempt ${attempt + 2}/3).`)
+
+        console.warn(
+          `Gemini temporarily unavailable. Retry ${attempt + 1}/2 in ${delay}ms.`
+        )
+
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     }
 
-    if (lastError) throw lastError
-
-    if (!response.text) throw new Error('Gemini returned an empty response.')
+    if (!response && lastError) throw lastError
+    if (!response.text) {
+      throw new Error('Gemini returned an empty response.')
+    }
 
     const parsed = JSON.parse(response.text)
 
-    // Accept classifications only for actual supplied source titles.
     const sources = fallback.sources.map(source => {
       const classification = Array.isArray(parsed.sourceRelevance)
-        ? parsed.sourceRelevance.find(item => item.sourceTitle === source.title)
+        ? parsed.sourceRelevance.find(
+            item => item.sourceTitle === source.title
+          )
         : null
 
-      const status = ['relevant', 'partially relevant', 'irrelevant']
-        .includes(classification?.status)
+      const status = [
+        'relevant',
+        'partially relevant',
+        'irrelevant'
+      ].includes(classification?.status)
         ? classification.status
         : source.relevance.status
 
@@ -574,7 +582,6 @@ ${source.text.slice(0, 9000)}
       source => source.relevance.status === 'irrelevant'
     )
 
-    // All sources irrelevant: do not show unrelated AI findings.
     if (!relevantSources.length) {
       return {
         ...fallback,
@@ -598,11 +605,18 @@ ${source.text.slice(0, 9000)}
       }
     }
 
-    const safeGaps = validateFindings(parsed.gaps, allSources, fallback.gaps)
-    const safeConflicts = validateFindings(parsed.conflicts, allSources, fallback.conflicts)
-    const safeOutdated = validateFindings(parsed.outdated, allSources, fallback.outdated)
+    const safeGaps = validateFindings(
+      parsed.gaps, allSources, fallback.gaps
+    )
 
-    // Remove findings that cite only sources classified as irrelevant.
+    const safeConflicts = validateFindings(
+      parsed.conflicts, allSources, fallback.conflicts
+    )
+
+    const safeOutdated = validateFindings(
+      parsed.outdated, allSources, fallback.outdated
+    )
+
     const filterFindings = items => items.filter(item =>
       !item.sourceTitles.length ||
       item.sourceTitles.some(title =>
@@ -622,14 +636,21 @@ ${source.text.slice(0, 9000)}
       conflicts: filterFindings(safeConflicts),
       outdated: filterFindings(safeOutdated),
       checklist: Array.isArray(parsed.checklist)
-        ? parsed.checklist.filter(item => typeof item === 'string').slice(0, 20)
+        ? parsed.checklist
+            .filter(item => typeof item === 'string')
+            .slice(0, 20)
         : fallback.checklist,
       topics: Array.isArray(parsed.topics)
-        ? parsed.topics.filter(item => typeof item === 'string').slice(0, 20)
+        ? parsed.topics
+            .filter(item => typeof item === 'string')
+            .slice(0, 20)
         : fallback.topics
     }
   } catch (error) {
-    console.error('Gemini analysis unavailable after retry; using rules:', error.message)
+    console.error(
+      'Gemini analysis unavailable; using rules:',
+      error.message
+    )
     return fallback
   }
 }
@@ -637,7 +658,9 @@ ${source.text.slice(0, 9000)}
 app.post('/api/analyze', async (req, res) => {
   try {
     const question = String(req.body?.question || '').trim()
-    const input = Array.isArray(req.body?.sources) ? req.body.sources : []
+    const input = Array.isArray(req.body?.sources)
+      ? req.body.sources
+      : []
 
     if (question.length < 6) {
       return res.status(400).json({
@@ -646,14 +669,20 @@ app.post('/api/analyze', async (req, res) => {
     }
 
     if (!input.length) {
-      return res.status(400).json({ error: 'Please add at least one source.' })
+      return res.status(400).json({
+        error: 'Please add at least one source.'
+      })
     }
 
     if (input.length > 8) {
-      return res.status(400).json({ error: 'A maximum of 8 sources is supported.' })
+      return res.status(400).json({
+        error: 'A maximum of 8 sources is supported.'
+      })
     }
 
+    console.time('SOURCE COLLECTION')
     const sources = await collectSources(input)
+    console.timeEnd('SOURCE COLLECTION')
 
     if (!sources.length) {
       return res.status(400).json({
@@ -661,12 +690,18 @@ app.post('/api/analyze', async (req, res) => {
       })
     }
 
+    console.time('RULE ANALYSIS')
     const fallback = ruleAnalysis(question, sources)
+    console.timeEnd('RULE ANALYSIS')
+
+    console.time('GEMINI ANALYSIS')
     const result = await geminiAnalysis(question, sources, fallback)
+    console.timeEnd('GEMINI ANALYSIS')
 
     res.json(result)
   } catch (error) {
     console.error(error)
+
     res.status(500).json({
       error: error.message || 'Unexpected server error.'
     })
@@ -674,5 +709,7 @@ app.post('/api/analyze', async (req, res) => {
 })
 
 app.listen(PORT, () => {
-  console.log(`Digital Dark Spot API running at http://localhost:${PORT}`)
+  console.log(
+    `Digital Dark Spot API running at http://localhost:${PORT}`
+  )
 })
