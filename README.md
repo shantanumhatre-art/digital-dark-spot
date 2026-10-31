@@ -14,7 +14,7 @@ AI-assisted information gap detection platform.
 5. Run `npm --prefix server install`
 6. Optional: copy `server/.env.example` to `server/.env` and add a Gemini API key.
 7. Run `npm run dev`
-8. Open the frontend at http://localhost:5173
+8. Open the frontend at http://localhost:5175
 
 The backend runs at http://localhost:5000.
 
